@@ -1,0 +1,51 @@
+.retry429-settings .retry429-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 12px;
+    margin-top: 8px;
+}
+
+.retry429-settings .retry429-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.retry429-settings .retry429-field label {
+    font-size: 0.85em;
+    opacity: 0.9;
+}
+
+.retry429-settings .retry429-field input[type="number"] {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.retry429-settings .retry429-toggles {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.retry429-settings .retry429-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
+    font-size: 0.85em;
+}
+
+.retry429-settings .retry429-stats {
+    opacity: 0.85;
+}
+
+.retry429-settings .retry429-hint {
+    margin-top: 6px;
+    font-size: 0.8em;
+    opacity: 0.7;
+    line-height: 1.4;
+}
