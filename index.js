@@ -1,7 +1,7 @@
 /**
- * 429 Auto Retry Extension for TauriTavern / SillyTavern
- * 拦截生成请求，在遇到 Vertex AI / API 429（及可选 502/503/529）错误时
- * 按「Retry-After 优先 + 指数退避 + 随机抖动」策略自动重试。
+ * 429 Auto Retry Extension for TauriTavern / SillyTavern (v1.1.0)
+ * 拦截生成请求（含流式 SSE 首包错误检测），在遇到 Vertex AI / API 429
+ * （及可选 502/503/529）错误时，按「Retry-After 优先 + 指数退避 + 随机抖动」自动重试。
  */
 (() => {
     const MODULE_NAME = 'st_429_auto_retry';
@@ -25,15 +25,19 @@
         debugLog: false,
     });
 
-    // 匹配常见的生成请求路径（Chat Completion 涵盖 Vertex AI、AI Studio、OpenAI、Claude 等）
+    // 匹配 TauriTavern / SillyTavern 生成请求路径
     const TARGET_PATH_PATTERNS = [
         /\/api\/backends\/chat-completions\/generate(?:\?|$)/i,
         /\/api\/backends\/text-completions\/generate(?:\?|$)/i,
+        /\/api\/[^?#]*\/generate(?:\?|$)/i,
+        /\/chat\/completions(?:\?|$)/i,
     ];
 
-    // 识别后端将上游 429 包装进非 429 状态码（如 500/400）的错误文本
-    const RATE_LIMIT_TEXT_PATTERN = /\b429\b|RESOURCE_EXHAUSTED|Too Many Requests|Quota exceeded|rate[\s_-]?limit/i;
-    const OVERLOAD_TEXT_PATTERN = /\b503\b|UNAVAILABLE|overloaded|Service Unavailable/i;
+    // 识别 429 / Vertex RESOURCE_EXHAUSTED / 503 过载特征
+    const RATE_LIMIT_TEXT_PATTERN =
+        /(?:\bstatus\s*429\b|\bcode["'\s:=]+429\b|\bHTTP\s*429\b|\b429\b|RESOURCE_EXHAUSTED|Resource exhausted|Too Many Requests|Quota exceeded|rate[\s_-]?limit)/i;
+    const OVERLOAD_TEXT_PATTERN =
+        /(?:\bstatus\s*(?:502|503|529)\b|\bcode["'\s:=]+(?:502|503|529)\b|\b503\b|UNAVAILABLE|overloaded|Service Unavailable)/i;
 
     const stats = {
         attempts: 0,
@@ -180,57 +184,188 @@
         });
     }
 
-    async function inspectRetryReason(response, cfg) {
+    function matchErrorText(text, cfg) {
+        if (!text) return null;
+        if (RATE_LIMIT_TEXT_PATTERN.test(text)) {
+            return '429 (Resource Exhausted)';
+        }
+        if (cfg.retryOnOverload && OVERLOAD_TEXT_PATTERN.test(text)) {
+            return '503 (服务临时过载)';
+        }
+        return null;
+    }
+
+    /**
+     * 检查 SSE 事件文本是否为错误事件（只检查 error / API 错误，避免误判正常正文内容）
+     */
+    function inspectSseChunkForError(chunkText, cfg) {
+        if (!chunkText) return null;
+
+        // 逐行解析 SSE 的 data: 负载
+        const lines = chunkText.split(/\r?\n/);
+        for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (!line || line.startsWith(':')) continue;
+
+            if (line.startsWith('event:') && /error/i.test(line)) {
+                const reason = matchErrorText(chunkText, cfg);
+                if (reason) return `SSE ${reason}`;
+            }
+
+            const payload = line.startsWith('data:') ? line.slice(5).trim() : line;
+            if (!payload || payload === '[DONE]') continue;
+
+            try {
+                const obj = JSON.parse(payload);
+                // 仅当 JSON 显式包含 error 字段时才判定为 API 错误
+                if (obj && obj.error) {
+                    const errStr = typeof obj.error === 'string' ? obj.error : JSON.stringify(obj.error);
+                    const reason = matchErrorText(errStr, cfg);
+                    if (reason) return `SSE ${reason}`;
+                }
+            } catch {
+                // 非 JSON 行：仅在包含明显 API 错误前缀时判定
+                if (/\[API\s*错误\]|endpoint failed with status/i.test(payload)) {
+                    const reason = matchErrorText(payload, cfg);
+                    if (reason) return `SSE ${reason}`;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 对 2xx text/event-stream 响应无损窥视首个有效数据块：
+     * - 若首个有效块就是 429/503 错误，直接取消流并告知需要重试；
+     * - 若是正常流数据，重建一个新 Response 把已读出的块放回流首，零延迟透传后续所有数据。
+     */
+    async function peekEventStreamResponse(response, cfg) {
+        if (!response.body) {
+            return { retryReason: null, response };
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8', { fatal: false });
+        const bufferedChunks = [];
+        let accumulatedText = '';
+
+        try {
+            // 最多读 4 个非空 chunk（通常 1 个就够了，跳过前置心跳/空行）
+            for (let i = 0; i < 4; i++) {
+                const { done, value } = await reader.read();
+                if (value && value.byteLength > 0) {
+                    bufferedChunks.push(value);
+                    accumulatedText += decoder.decode(value, { stream: !done });
+                }
+
+                const trimmed = accumulatedText.trim();
+                const hasDataLine = /(?:^|\n)\s*(?:data:|event:|\{|\[API)/i.test(trimmed);
+
+                if (hasDataLine || done) {
+                    const sseError = inspectSseChunkForError(accumulatedText, cfg);
+                    if (sseError) {
+                        try {
+                            await reader.cancel();
+                        } catch {
+                            // ignore
+                        }
+                        return { retryReason: sseError, response };
+                    }
+                    break;
+                }
+            }
+        } catch (err) {
+            // 如果读取首包时被用户中止，直接抛出 AbortError
+            if (err && err.name === 'AbortError') {
+                throw err;
+            }
+            logDebug('窥视 SSE 首包异常，直接放行:', err);
+        }
+
+        // 重建流：先把已缓存的 chunk 原样推出，再无缝透传剩余流
+        const passthroughStream = new ReadableStream({
+            start(controller) {
+                for (const chunk of bufferedChunks) {
+                    controller.enqueue(chunk);
+                }
+            },
+            async pull(controller) {
+                try {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        controller.close();
+                    } else if (value) {
+                        controller.enqueue(value);
+                    }
+                } catch (err) {
+                    controller.error(err);
+                }
+            },
+            cancel(reason) {
+                return reader.cancel(reason);
+            },
+        });
+
+        const rebuiltResponse = new Response(passthroughStream, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+        });
+
+        return { retryReason: null, response: rebuiltResponse };
+    }
+
+    async function inspectResponse(response, cfg) {
         const status = response.status;
 
         if (status === 429) {
-            return 'HTTP 429 (Too Many Requests)';
+            return { retryReason: 'HTTP 429 (Too Many Requests)', response };
         }
 
         if (cfg.retryOnOverload && (status === 502 || status === 503 || status === 529)) {
-            return `HTTP ${status} (服务临时过载)`;
+            return { retryReason: `HTTP ${status} (服务临时过载)`, response };
         }
 
         const contentType = (response.headers?.get?.('content-type') || '').toLowerCase();
 
-        // 流式 SSE 正常建立（2xx）后直接放行，绝不克隆消耗流
+        // 流式 SSE 2xx：无损窥视首包，捕获 TauriTavern / 酒馆在 SSE 第一帧发回的 429 错误
         if (response.ok && contentType.includes('text/event-stream')) {
-            return null;
+            return await peekEventStreamResponse(response, cfg);
         }
 
-        // 非 2xx 响应，或 2xx 但返回的是 JSON（某些后端会把上游错误包在 200 JSON 里）
-        if (!response.ok || contentType.includes('application/json')) {
+        // 非 2xx 响应，或 2xx 但返回 JSON/文本错误
+        if (!response.ok || contentType.includes('application/json') || contentType.includes('text/plain')) {
             try {
                 const text = await response.clone().text();
-                if (!text) return null;
+                if (!text) return { retryReason: null, response };
 
-                // 若 2xx JSON，必须明确带有 error 字段才检查，避免误判正常回复内容中出现 "429"
                 if (response.ok) {
-                    const json = JSON.parse(text);
-                    if (!json || !json.error) return null;
-                    const errStr = typeof json.error === 'string' ? json.error : JSON.stringify(json.error);
-                    if (RATE_LIMIT_TEXT_PATTERN.test(errStr)) {
-                        return 'API 429 (RESOURCE_EXHAUSTED)';
+                    try {
+                        const json = JSON.parse(text);
+                        if (json && json.error) {
+                            const errStr = typeof json.error === 'string' ? json.error : JSON.stringify(json.error);
+                            const reason = matchErrorText(errStr, cfg);
+                            if (reason) return { retryReason: `API ${reason}`, response };
+                        }
+                    } catch {
+                        if (/\[API\s*错误\]|endpoint failed with status/i.test(text)) {
+                            const reason = matchErrorText(text, cfg);
+                            if (reason) return { retryReason: `API ${reason}`, response };
+                        }
                     }
-                    if (cfg.retryOnOverload && OVERLOAD_TEXT_PATTERN.test(errStr)) {
-                        return 'API 503 (服务临时过载)';
-                    }
-                    return null;
+                    return { retryReason: null, response };
                 }
 
-                // 非 2xx 响应体检查
-                if (RATE_LIMIT_TEXT_PATTERN.test(text)) {
-                    return `HTTP ${status} (上游 429 / RESOURCE_EXHAUSTED)`;
-                }
-                if (cfg.retryOnOverload && OVERLOAD_TEXT_PATTERN.test(text)) {
-                    return `HTTP ${status} (上游 503 / 过载)`;
+                const reason = matchErrorText(text, cfg);
+                if (reason) {
+                    return { retryReason: `HTTP ${status} (${reason})`, response };
                 }
             } catch {
-                // 忽略解析异常，按正常响应返回
+                // 忽略解析异常
             }
         }
 
-        return null;
+        return { retryReason: null, response };
     }
 
     function installFetchInterceptor() {
@@ -251,6 +386,9 @@
                 return originalFetch(input, init);
             }
 
+            const url = getRequestUrl(input);
+            logDebug('拦截到生成请求:', url);
+
             const signal = init?.signal || (input instanceof Request ? input.signal : undefined);
 
             let lastResponse = null;
@@ -260,13 +398,12 @@
                     throw new DOMException('The operation was aborted.', 'AbortError');
                 }
 
-                // 若入参是 Request 对象，每次发送前 clone 一份，避免 body 已被消费
                 const reqInput = input instanceof Request ? input.clone() : input;
-                const response = await originalFetch(reqInput, init);
+                const rawResponse = await originalFetch(reqInput, init);
+                const { retryReason, response } = await inspectResponse(rawResponse, cfg);
                 lastResponse = response;
 
-                const reason = await inspectRetryReason(response, cfg);
-                if (!reason) {
+                if (!retryReason) {
                     if (attempt > 0) {
                         stats.recovered += 1;
                         updateStatsUI();
@@ -279,8 +416,8 @@
                 if (attempt >= maxRetries) {
                     stats.failed += 1;
                     updateStatsUI();
-                    logDebug(`已达最大重试次数 (${maxRetries})，放弃重试。原因: ${reason}`);
-                    notify('error', `已重试 ${maxRetries} 次仍失败（${reason}）`);
+                    logDebug(`已达最大重试次数 (${maxRetries})，放弃重试。原因: ${retryReason}`);
+                    notify('error', `已重试 ${maxRetries} 次仍失败（${retryReason}）`);
                     return lastResponse;
                 }
 
@@ -289,8 +426,8 @@
 
                 const delayMs = computeDelayMs(attempt, response, cfg);
                 const delaySec = (delayMs / 1000).toFixed(1);
-                logDebug(`触发重试 (${attempt + 1}/${maxRetries})，原因: ${reason}，等待 ${delayMs}ms`);
-                notify('warning', `${reason}，${delaySec}s 后进行第 ${attempt + 1}/${maxRetries} 次重试…`);
+                logDebug(`触发重试 (${attempt + 1}/${maxRetries})，原因: ${retryReason}，等待 ${delayMs}ms`);
+                notify('warning', `${retryReason}，${delaySec}s 后进行第 ${attempt + 1}/${maxRetries} 次重试…`);
 
                 await sleepWithAbort(delayMs, signal);
             }
@@ -298,7 +435,7 @@
             return lastResponse;
         };
 
-        logDebug('Fetch 拦截器已挂载');
+        console.info('[429-Auto-Retry] v1.1.0 Fetch 拦截器已激活（支持流式 SSE 首包 429 检测）');
     }
 
     function renderSettingsUI() {
@@ -314,15 +451,13 @@
             return;
         }
 
-        const cfg = getSettings();
-
         const wrapper = document.createElement('div');
         wrapper.id = 'retry429_settings_root';
         wrapper.className = 'retry429-settings';
         wrapper.innerHTML = `
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
-                    <b>429 自动重试 (Vertex / API)</b>
+                    <b>429 自动重试 (Vertex / API) v1.1</b>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
@@ -369,7 +504,7 @@
                     </div>
 
                     <div class="retry429-hint">
-                        策略：优先遵循响应头 Retry-After，否则按指数退避 + ±25% 随机抖动等待。点击“停止生成”会立即取消等待。
+                        策略：支持 HTTP 429 与流式 SSE 首包 429 检测；优先遵循 Retry-After，否则指数退避 + ±25% 抖动。点“停止生成”立即取消。
                     </div>
 
                     <div class="retry429-footer">
@@ -438,10 +573,7 @@
         syncToUI();
     }
 
-    function bootstrap() {
-        installFetchInterceptor();
-
-        // 等待扩展设置容器渲染完成
+    function mountUIWhenReady() {
         const tryRender = () => {
             if (document.getElementById('extensions_settings2') || document.getElementById('extensions_settings')) {
                 renderSettingsUI();
@@ -460,11 +592,15 @@
         }
     }
 
+    // 1. 立即同步挂载 fetch 拦截器，避免其他脚本提前缓存原始 window.fetch
+    installFetchInterceptor();
+
+    // 2. 等 DOM 就绪后挂载设置面板
     if (window.jQuery) {
-        window.jQuery(bootstrap);
+        window.jQuery(mountUIWhenReady);
     } else if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', bootstrap);
+        document.addEventListener('DOMContentLoaded', mountUIWhenReady);
     } else {
-        bootstrap();
+        mountUIWhenReady();
     }
 })();
